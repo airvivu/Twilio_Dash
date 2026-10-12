@@ -230,7 +230,10 @@ function validateCfg(inp, lineNumber) {
     if (digits(number) === digits(lineNumber)) return { error: 'An agent number cannot be the line itself.' };
     if (seen.has(number)) return { error: `${number} is listed twice.` };
     seen.add(number);
-    agents.push({ number, name: String(a.name || '').trim().slice(0, 30), active: a.active !== false });
+    const sendDigits = String(a.sendDigits || '').replace(/\s/g, '');
+    if (!/^[0-9wW*#]{0,32}$/.test(sendDigits)) return { error: `Extension digits for ${number} can only use 0-9, *, # and w (half-second pause).` };
+    agents.push({ number, name: String(a.name || '').trim().slice(0, 30), active: a.active !== false,
+      capacity: clampInt(a.capacity, 1, 50, 1), sendDigits });
   }
   const holdMusic = String(inp.holdMusic || '').trim();
   if (holdMusic && (!/^https?:\/\/\S+$/.test(holdMusic) || holdMusic.length > 200)) {
@@ -256,7 +259,7 @@ function validateCfg(inp, lineNumber) {
 const BUSY = ['queue', 'voicemail', 'hangup'];
 function pack(c) {
   const p = {
-    a: c.agents.map(a => [a.number, a.name, a.active ? 1 : 0]),
+    a: c.agents.map(a => [a.number, a.name, a.active ? 1 : 0, a.capacity, a.sendDigits || '']),
     m: c.mode === 'rotate' ? 1 : 0, r: c.ringTimeout, s: c.screen ? 1 : 0, k: c.callerId === 'twilio' ? 1 : 0,
     b: BUSY.indexOf(c.whenBusy), w: c.maxWait, o: c.afterWait === 'hangup' ? 1 : 0,
   };
@@ -270,7 +273,8 @@ function unpack(s) {
     const p = JSON.parse(Buffer.from(String(s || ''), 'base64url').toString());
     if (!Array.isArray(p.a) || !p.a.length) return null;
     return {
-      agents: p.a.map(([number, name, on]) => ({ number: String(number), name: String(name || ''), active: !!on })),
+      agents: p.a.map(([number, name, on, cap, sd]) => ({ number: String(number), name: String(name || ''), active: !!on,
+        capacity: Math.max(1, Number(cap) || 1), sendDigits: String(sd || '') })),
       mode: p.m ? 'rotate' : 'priority', ringTimeout: p.r || 20, screen: !!p.s, callerId: p.k ? 'twilio' : 'caller',
       whenBusy: BUSY[p.b] || 'queue', maxWait: p.w || 300, afterWait: p.o ? 'hangup' : 'voicemail',
       message: p.g || '', holdMusic: p.h || '', prev: p.p || '',
@@ -280,36 +284,55 @@ function unpack(s) {
 const cfgFromUrl = u => { const m = /\/voice\/incoming\?c=([A-Za-z0-9_-]+)/.exec(u || ''); return m ? unpack(m[1]) : null; };
 
 // --- Short-lived memory (safe to lose on restart) ---
-const reserved = new Map();    // agent digits -> expiry: just handed a call, not yet visible in Twilio
-const cooldown = new Map();    // agent digits -> expiry: missed/declined a call, skip briefly
+const reserved = new Map();    // destination digits -> Map(callerCallSid -> expiry): sent a call, not yet visible in Twilio
+const cooldown = new Map();    // destination digits -> expiry: gave busy / no answer, skip briefly
 const accepted = new Map();    // parentCallSid:agentIndex -> expiry: agent pressed 1
 const queuedSince = new Map(); // callSid -> first time the caller was put on hold
 const queues = new Map();      // queueSid -> { c, to, base, size, at }
-const rr = new Map();          // line digits -> last agent index (rotate mode)
+const rr = new Map();          // line digits -> last destination index (rotate mode)
 
 setInterval(() => {
   const now = Date.now();
-  for (const m of [reserved, cooldown, accepted]) for (const [k, v] of m) if (v < now) m.delete(k);
+  for (const m of [cooldown, accepted]) for (const [k, v] of m) if (v < now) m.delete(k);
+  for (const [d, m] of reserved) { for (const [k, v] of m) if (v < now) m.delete(k); if (!m.size) reserved.delete(d); }
   for (const [k, v] of queuedSince) if (now - v > 3 * 3600e3) queuedSince.delete(k);
 }, 60000).unref();
 
+// Each destination (a phone, or a PBX / toll-free line) has a number of lines = calls it may hold at once.
+// Lines in use = open calls Twilio reports to that number + calls we've just sent that Twilio doesn't show yet.
+// Both are keyed by the caller's CallSid, so a call is never counted twice.
 function agentStates(cfg, calls) {
   const now = Date.now();
-  const byTo = new Map();
+  const open = new Map(); // digits -> Map(callerSid -> line)
   for (const c of calls || []) {
     const d = digits(c.to);
-    if (!byTo.has(d) || c.status === 'in-progress') byTo.set(d, c);
+    if (!open.has(d)) open.set(d, new Map());
+    const key = c.parent_call_sid || c.sid, prev = open.get(d).get(key);
+    if (!prev || c.status === 'in-progress') open.get(d).set(key, {
+      with: c.from_formatted || c.from, status: c.status,
+      startTime: c.start_time ? new Date(c.start_time).toISOString() : null,
+    });
   }
   return cfg.agents.map((a, i) => {
-    const d = digits(a.number), call = byTo.get(d);
+    const d = digits(a.number);
+    const lines = new Map(open.get(d) || []);
+    const resv = reserved.get(d);
+    if (resv && calls) for (const [k, exp] of resv) {
+      if (lines.has(k) || exp <= now) resv.delete(k); // Twilio shows it now, so stop counting our placeholder
+      else lines.set(k, { status: 'ringing' });
+    }
+    if (resv && !calls) for (const [k, exp] of resv) if (exp > now && !lines.has(k)) lines.set(k, { status: 'ringing' });
+    const all = [...lines.values()];
+    const talking = all.filter(l => l.status === 'in-progress');
     let state = 'free';
-    if (call && call.status === 'in-progress') state = 'on-call';
-    else if (call || (reserved.get(d) || 0) > now) state = 'ringing';
-    else if (!a.active) state = 'paused';
+    if (!a.active) state = 'paused';
     else if ((cooldown.get(d) || 0) > now) state = 'cooldown';
+    else if (lines.size >= a.capacity) state = 'full';
     return {
-      index: i, number: a.number, name: a.name, active: a.active, state,
-      call: call ? { with: call.from_formatted || call.from, startTime: call.start_time ? new Date(call.start_time).toISOString() : null } : null,
+      index: i, number: a.number, name: a.name, active: a.active, capacity: a.capacity, sendDigits: a.sendDigits,
+      state, inUse: lines.size, onCall: talking.length, ringing: lines.size - talking.length,
+      freeLines: state === 'free' ? a.capacity - lines.size : 0,
+      calls: talking.map(l => ({ with: l.with, startTime: l.startTime })),
     };
   });
 }
@@ -348,13 +371,15 @@ function verifyTwilio(req, res, next) {
 
 // --- TwiML builders ---
 function dialAgent(res, cfg, base, c, agent, tried, body) {
-  reserved.set(digits(agent.number), Date.now() + (cfg.ringTimeout + 20) * 1000);
+  const d = digits(agent.number);
+  if (!reserved.has(d)) reserved.set(d, new Map());
+  reserved.get(d).set(body.CallSid, Date.now() + (cfg.ringTimeout + 20) * 1000);
   const tr = [...tried, agent.index].join('.');
   const action = `${base}/voice/dial-done?c=${c}&ag=${agent.index}&tr=${tr}`;
   const cid = cfg.callerId === 'twilio' ? ` callerId="${xml(body.To)}"` : '';
   const screen = cfg.screen ? ` url="${xml(`${base}/voice/screen?ag=${agent.index}`)}" method="POST"` : '';
   return twiml(res, `<Dial timeout="${cfg.ringTimeout}" answerOnBridge="true"${cid} action="${xml(action)}" method="POST">` +
-    `<Number${screen}>${xml(agent.number)}</Number></Dial>`);
+    `<Number${screen}${agent.sendDigits ? ` sendDigits="${xml(agent.sendDigits)}"` : ''}>${xml(agent.number)}</Number></Dial>`);
 }
 
 function voicemail(res, base) {
@@ -411,7 +436,7 @@ app.post('/voice/route', verifyTwilio, handle((req, res) => route(req, res, { fr
 app.post('/voice/dial-done', verifyTwilio, handle(async (req, res) => {
   const cfg = unpack(req.query.c), b = req.body, i = Number(req.query.ag);
   const agent = cfg && cfg.agents[i];
-  if (agent) reserved.delete(digits(agent.number));
+  if (agent && reserved.has(digits(agent.number))) reserved.get(digits(agent.number)).delete(b.CallSid);
   const key = `${b.CallSid}:${i}`;
   const bridged = b.DialBridged != null
     ? String(b.DialBridged) === 'true'
@@ -493,7 +518,7 @@ async function pump() {
       for (const m of overdue) await release(m); // route() sends them to voicemail / goodbye
       const waiting = members.filter(m => !overdue.includes(m));
       if (!waiting.length) continue;
-      const free = agentStates(cfg, (await liveCalls(true)) || []).filter(s => s.state === 'free').length;
+      const free = agentStates(cfg, (await liveCalls(true)) || []).reduce((n, s) => n + s.freeLines, 0);
       for (const m of waiting.slice(0, free)) await release(m);
     }
   } catch (e) {
