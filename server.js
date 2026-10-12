@@ -301,7 +301,7 @@ setInterval(() => {
 // Each destination (a phone, or a PBX / toll-free line) has a number of lines = calls it may hold at once.
 // Lines in use = open calls Twilio reports to that number + calls we've just sent that Twilio doesn't show yet.
 // Both are keyed by the caller's CallSid, so a call is never counted twice.
-function agentStates(cfg, calls) {
+function agentStates(cfg, calls, ignoreSid) {
   const now = Date.now();
   const open = new Map(); // digits -> Map(callerSid -> line)
   for (const c of calls || []) {
@@ -319,9 +319,9 @@ function agentStates(cfg, calls) {
     const resv = reserved.get(d);
     if (resv && calls) for (const [k, exp] of resv) {
       if (lines.has(k) || exp <= now) resv.delete(k); // Twilio shows it now, so stop counting our placeholder
-      else lines.set(k, { status: 'ringing' });
+      else if (k !== ignoreSid) lines.set(k, { status: 'ringing' });
     }
-    if (resv && !calls) for (const [k, exp] of resv) if (exp > now && !lines.has(k)) lines.set(k, { status: 'ringing' });
+    if (resv && !calls) for (const [k, exp] of resv) if (exp > now && k !== ignoreSid && !lines.has(k)) lines.set(k, { status: 'ringing' });
     const all = [...lines.values()];
     const talking = all.filter(l => l.status === 'in-progress');
     let state = 'free';
@@ -337,8 +337,8 @@ function agentStates(cfg, calls) {
   });
 }
 
-function pickAgent(cfg, line, tried, calls) {
-  const free = agentStates(cfg, calls).filter(s => s.state === 'free' && !tried.includes(s.index));
+function pickAgent(cfg, line, tried, calls, callSid) {
+  const free = agentStates(cfg, calls, callSid).filter(s => s.state === 'free' && !tried.includes(s.index));
   if (!free.length) return null;
   if (cfg.mode === 'rotate') {
     const last = rr.has(line) ? rr.get(line) : -1;
@@ -349,8 +349,15 @@ function pickAgent(cfg, line, tried, calls) {
   return free[0];
 }
 
-function waitingFor(to) {
-  for (const q of queues.values()) if (digits(q.to) === digits(to) && Date.now() - q.at < 60000) return q.size;
+// Are callers already on hold (on any of your numbers) for a destination this caller could use?
+// If so, a brand-new caller waits behind them instead of grabbing the next free line.
+function waitingFor(cfg) {
+  const mine = new Set(cfg.agents.map(a => digits(a.number)));
+  for (const q of queues.values()) {
+    if (!q.size || Date.now() - q.at > 60000) continue;
+    const other = unpack(q.c);
+    if (other && other.agents.some(a => mine.has(digits(a.number)))) return q.size;
+  }
   return 0;
 }
 
@@ -372,6 +379,7 @@ function verifyTwilio(req, res, next) {
 // --- TwiML builders ---
 function dialAgent(res, cfg, base, c, agent, tried, body) {
   const d = digits(agent.number);
+  for (const m of reserved.values()) m.delete(body.CallSid); // drop any line held for this caller elsewhere
   if (!reserved.has(d)) reserved.set(d, new Map());
   reserved.get(d).set(body.CallSid, Date.now() + (cfg.ringTimeout + 20) * 1000);
   const tr = [...tried, agent.index].join('.');
@@ -415,8 +423,8 @@ async function route(req, res, { fresh }) {
   if (cfg.whenBusy === 'queue' && since && Date.now() - since >= cfg.maxWait * 1000) return overflow(res, cfg, base, b.CallSid);
   const calls = await liveCalls();
   // If callers are already on hold for this line, a new caller joins the back of the line.
-  if (fresh && cfg.whenBusy === 'queue' && waitingFor(b.To) > 0) return enqueue(res, cfg, base, c, b);
-  const agent = pickAgent(cfg, digits(b.To), tried, calls || []);
+  if (fresh && cfg.whenBusy === 'queue' && waitingFor(cfg) > 0) return enqueue(res, cfg, base, c, b);
+  const agent = pickAgent(cfg, digits(b.To), tried, calls || [], b.CallSid);
   if (agent) return dialAgent(res, cfg, base, c, agent, tried, b);
   return allBusy(res, cfg, base, c, b);
 }
@@ -496,30 +504,45 @@ function schedulePump(delay) {
   pumpDue = due;
   pumpTimer = setTimeout(pump, delay);
 }
+const release = ({ qsid, q, m }) => twilio(`${BASE}/Queues/${qsid}/Members/${m.call_sid}.json`,
+  { form: { Url: `${q.base}/voice/route?c=${q.c}`, Method: 'POST' } }).catch(e => console.error('Dequeue failed:', e.message));
+
 async function pump() {
   pumpTimer = null;
   if (pumping) return schedulePump(1000);
   pumping = true;
   try {
+    // Gather held callers from every one of your numbers, so shared PBX lines go to whoever waited longest.
+    const waiting = [];
     for (const [qsid, q] of queues) {
       const cfg = unpack(q.c);
       if (!cfg) { queues.delete(qsid); continue; }
-      const members = ((await twilio(`${BASE}/Queues/${qsid}/Members.json?PageSize=100`)).queue_members || [])
-        .sort((a, b) => a.position - b.position);
+      const members = (await twilio(`${BASE}/Queues/${qsid}/Members.json?PageSize=100`)).queue_members || [];
       q.size = members.length; q.at = Date.now();
       if (!members.length) { queues.delete(qsid); continue; }
-      const release = m => twilio(`${BASE}/Queues/${qsid}/Members/${m.call_sid}.json`,
-        { form: { Url: `${q.base}/voice/route?c=${q.c}`, Method: 'POST' } }).catch(e => console.error('Dequeue failed:', e.message));
       const now = Date.now();
-      const overdue = members.filter(m => {
+      for (const m of members) {
         const since = queuedSince.get(m.call_sid) ?? now - (Number(m.wait_time) || 0) * 1000;
-        return now - since >= cfg.maxWait * 1000;
-      });
-      for (const m of overdue) await release(m); // route() sends them to voicemail / goodbye
-      const waiting = members.filter(m => !overdue.includes(m));
-      if (!waiting.length) continue;
-      const free = agentStates(cfg, (await liveCalls(true)) || []).reduce((n, s) => n + s.freeLines, 0);
-      for (const m of waiting.slice(0, free)) await release(m);
+        const item = { qsid, q, cfg, m, since };
+        if (now - since >= cfg.maxWait * 1000) await release(item); // route() sends them to voicemail / goodbye
+        else waiting.push(item);
+      }
+    }
+    if (waiting.length) {
+      const calls = (await liveCalls(true)) || [];
+      const promised = new Map(); // destination digits -> lines handed out in this pass
+      waiting.sort((a, b) => a.since - b.since);
+      for (const item of waiting) {
+        const pick = agentStates(item.cfg, calls).find(s =>
+          s.state === 'free' && s.freeLines - (promised.get(digits(s.number)) || 0) > 0);
+        if (!pick) continue;
+        const d = digits(pick.number);
+        promised.set(d, (promised.get(d) || 0) + 1);
+        // Hold this line for the released caller until they reconnect and get dialed.
+        if (!reserved.has(d)) reserved.set(d, new Map());
+        reserved.get(d).set(item.m.call_sid, Date.now() + 30000);
+        await release(item);
+      }
     }
   } catch (e) {
     console.error('Queue pump:', e.message);
@@ -586,7 +609,27 @@ app.post('/api/routing/:sid', requireAuth, async (req, res) => {
       form.VoiceFallbackMethod = 'POST';
     }
     await twilio(path, { form });
-    res.json({ ok: true });
+
+    // Lines belong to the PBX, not to the Twilio number: copy line counts to every other
+    // routed number that forwards to the same destination.
+    const caps = new Map(v.cfg.agents.map(a => [digits(a.number), a.capacity]));
+    const synced = [];
+    const all = (await twilio(`${BASE}/IncomingPhoneNumbers.json?PageSize=100`)).incoming_phone_numbers || [];
+    for (const n of all) {
+      if (n.sid === sid) continue;
+      const other = cfgFromUrl(n.voice_url);
+      if (!other) continue;
+      let changed = false;
+      for (const a of other.agents) {
+        const cap = caps.get(digits(a.number));
+        if (cap && cap !== a.capacity) { a.capacity = cap; changed = true; }
+      }
+      if (!changed) continue;
+      const otherBase = n.voice_url.slice(0, n.voice_url.indexOf('/voice/incoming?c='));
+      await twilio(`${BASE}/IncomingPhoneNumbers/${n.sid}.json`, { form: { VoiceUrl: `${otherBase}/voice/incoming?c=${pack(other)}` } });
+      synced.push(n.phone_number);
+    }
+    res.json({ ok: true, synced });
   } catch (e) {
     console.error(e);
     res.status(502).json({ error: e.message });
