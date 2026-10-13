@@ -636,31 +636,37 @@ app.post('/api/routing/:sid', requireAuth, async (req, res) => {
   }
 });
 
-// --- Voicemails / recordings ---
-const callInfo = new Map();
-app.get('/api/voicemails', requireAuth, async (req, res) => {
+// --- Unique callers per routed number (callers with +1 or +81 numbers) ---
+let uniqCache = { at: 0, data: null };
+app.get('/api/unique-callers', requireAuth, async (req, res) => {
+  if (uniqCache.data && Date.now() - uniqCache.at < 60000 && !req.query.fresh) return res.json(uniqCache.data);
   try {
-    const recs = (await twilio(`${BASE}/Recordings.json?PageSize=25`)).recordings || [];
-    await Promise.all(recs.filter(r => r.call_sid && !callInfo.has(r.call_sid)).map(r =>
-      twilio(`${BASE}/Calls/${r.call_sid}.json`)
-        .then(c => callInfo.set(r.call_sid, { from: c.from_formatted || c.from, to: c.to_formatted || c.to }))
-        .catch(() => {})));
-    res.json({
-      recordings: recs.map(r => ({
-        sid: r.sid, date: r.date_created ? new Date(r.date_created).toISOString() : null,
-        duration: Number(r.duration) || 0, ...(callInfo.get(r.call_sid) || {}),
-      })),
-    });
+    const nums = (await twilio(`${BASE}/IncomingPhoneNumbers.json?PageSize=100`)).incoming_phone_numbers || [];
+    const today = new Date().toISOString().slice(0, 10);
+    const week = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
+    const out = {};
+    await Promise.all(nums.filter(n => cfgFromUrl(n.voice_url)).map(async n => {
+      const calls = await listCalls(`To=${encodeURIComponent(n.phone_number)}&StartTime%3E=${week}`, 10);
+      const t = new Set(), w = new Set();
+      let callsToday = 0;
+      for (const c of calls) {
+        if (c.parent_call_sid || dirOf(c) !== 'inbound') continue; // the caller's own call, not forwards
+        const day = new Date(c.start_time || c.date_created).toISOString().slice(0, 10);
+        if (day === today) callsToday++;
+        const from = String(c.from || '');
+        if (!/^\+(1|81)/.test(from)) continue;
+        w.add(from);
+        if (day === today) t.add(from);
+      }
+      const us = [...t].filter(f => f.startsWith('+1')).length;
+      out[n.sid] = { today: t.size, todayUS: us, todayJP: t.size - us, week: w.size, callsToday };
+    }));
+    uniqCache = { at: Date.now(), data: { numbers: out, day: today } };
+    res.json(uniqCache.data);
   } catch (e) {
+    console.error(e);
     res.status(502).json({ error: e.message });
   }
-});
-
-app.get('/api/recordings/:sid', requireAuth, async (req, res) => {
-  if (!/^RE[0-9a-f]{32}$/i.test(req.params.sid)) return res.sendStatus(400);
-  const r = await fetch(`${API}${BASE}/Recordings/${req.params.sid}.mp3`, { headers: { Authorization: BASIC } });
-  if (!r.ok) return res.sendStatus(r.status);
-  res.type('audio/mpeg').send(Buffer.from(await r.arrayBuffer()));
 });
 
 app.get('/', (req, res) => res.json({ ok: true, service: 'twilio-dashboard-backend' }));
