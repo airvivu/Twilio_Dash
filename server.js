@@ -570,7 +570,7 @@ app.get('/api/routing', requireAuth, async (req, res) => {
         return {
           sid: n.sid, number: n.phone_number, name: n.friendly_name,
           voiceUrl: n.voice_url || '', fallbackUrl: n.voice_fallback_url || '',
-          routing: cfg, agents: cfg ? agentStates(cfg, calls || []) : [],
+          routing: cfg, agents: cfg ? agentStates(cfg, calls || []).map(a => ({ ...a, portalCode: portalCode(a.number) })) : [],
           waiting: q ? Number(q.current_size) || 0 : 0,
           avgWait: q ? Number(q.average_wait_time) || 0 : 0,
         };
@@ -592,6 +592,7 @@ app.post('/api/routing/:sid', requireAuth, async (req, res) => {
     const prev = existing ? existing.prev : (cur.voice_url || '');
     if (req.body.disable) {
       await twilio(path, { form: { VoiceUrl: prev } });
+      routedCache.at = 0;
       return res.json({ ok: true, restored: prev });
     }
     const v = validateCfg(req.body.config, cur.phone_number);
@@ -609,6 +610,7 @@ app.post('/api/routing/:sid', requireAuth, async (req, res) => {
       form.VoiceFallbackMethod = 'POST';
     }
     await twilio(path, { form });
+    routedCache.at = 0;
 
     // Lines belong to the PBX, not to the Twilio number: copy line counts to every other
     // routed number that forwards to the same destination.
@@ -666,6 +668,165 @@ app.get('/api/unique-callers', requireAuth, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(502).json({ error: e.message });
+  }
+});
+
+// =====================================================================
+// Partner (PBX) view-only portal
+// A partner signs in with their destination number + an access code you give them.
+// Codes are derived from a secret, so nothing has to be stored.
+// =====================================================================
+const PORTAL_SECRET = process.env.PORTAL_SECRET || SECRET;
+const B32 = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function portalCode(number) {
+  const h = crypto.createHmac('sha256', PORTAL_SECRET).update('portal:' + digits(number)).digest();
+  let s = '';
+  for (let i = 0; i < 8; i++) s += B32[h[i] % 32];
+  return s.slice(0, 4) + '-' + s.slice(4);
+}
+
+let routedCache = { at: 0, p: null };
+function routedNumbers() {
+  if (routedCache.p && Date.now() - routedCache.at < 30000) return routedCache.p;
+  routedCache.at = Date.now();
+  routedCache.p = twilio(`${BASE}/IncomingPhoneNumbers.json?PageSize=100`)
+    .then(r => (r.incoming_phone_numbers || [])
+      .map(n => ({ sid: n.sid, number: n.phone_number, cfg: cfgFromUrl(n.voice_url) })).filter(n => n.cfg))
+    .catch(e => { routedCache.at = 0; throw e; });
+  return routedCache.p;
+}
+
+// Every Twilio number that forwards to this destination, and how it's set up there.
+async function findDest(d) {
+  const uses = [];
+  for (const n of await routedNumbers()) {
+    const idx = n.cfg.agents.findIndex(a => digits(a.number) === d);
+    if (idx >= 0) uses.push({ line: n.number, cfg: n.cfg, agent: n.cfg.agents[idx] });
+  }
+  if (!uses.length) return null;
+  return { number: uses[0].agent.number, name: (uses.find(u => u.agent.name) || {}).agent?.name || '', uses };
+}
+
+const portalAttempts = new Map();
+app.post('/portal/login', async (req, res) => {
+  const now = Date.now();
+  const a = portalAttempts.get(req.ip);
+  if (a && a.resetAt > now && a.count >= 10) return res.status(429).json({ error: 'Too many attempts. Try again in 15 minutes.' });
+  const d = digits(req.body && req.body.number);
+  const code = String(req.body && req.body.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const fail = () => {
+    const cur = a && a.resetAt > now ? a : { count: 0, resetAt: now + 15 * 60 * 1000 };
+    cur.count++; portalAttempts.set(req.ip, cur);
+    res.status(401).json({ error: 'That number and access code don\'t match.' });
+  };
+  try {
+    if (d.length < 7) return fail();
+    const dest = await findDest(d);
+    if (!dest || !safeEq(code, portalCode(d).replace('-', ''))) return fail();
+    portalAttempts.delete(req.ip);
+    const exp = now + TOKEN_TTL_MS;
+    res.json({ token: `p.${d}.${exp}.${sign(`p:${d}:${exp}`)}`, expiresAt: exp });
+  } catch (e) {
+    console.error(e);
+    res.status(502).json({ error: 'Service unavailable. Please try again shortly.' });
+  }
+});
+
+function requirePortal(req, res, next) {
+  const t = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').split('.');
+  if (t.length !== 4 || t[0] !== 'p' || Number(t[2]) < Date.now() || !safeEq(t[3], sign(`p:${t[1]}:${t[2]}`))) {
+    return res.status(401).json({ error: 'Please sign in again.' });
+  }
+  req.dest = t[1];
+  next();
+}
+
+let queuesCache = { at: 0, p: null };
+function queueList() {
+  if (queuesCache.p && Date.now() - queuesCache.at < 3000) return queuesCache.p;
+  queuesCache.at = Date.now();
+  queuesCache.p = twilio(`${BASE}/Queues.json?PageSize=100`).then(r => r.queues || []).catch(() => []);
+  return queuesCache.p;
+}
+
+app.get('/portal/live', requirePortal, async (req, res) => {
+  try {
+    const d = req.dest, dest = await findDest(d);
+    if (!dest) return res.status(404).json({ error: 'This number is no longer set up. Contact your account manager.' });
+    const [calls, qs] = await Promise.all([liveCalls(), queueList()]);
+    const all = calls || [];
+    const byId = new Map(all.map(c => [c.sid, c]));
+    const live = all.filter(c => digits(c.to) === d && c.parent_call_sid).map(l => {
+      const p = byId.get(l.parent_call_sid);
+      return {
+        caller: p ? (p.from_formatted || p.from) : (l.from_formatted || l.from),
+        line: p ? (p.to_formatted || p.to) : null,
+        status: l.status,
+        startTime: l.start_time ? new Date(l.start_time).toISOString() : null,
+        created: l.date_created ? new Date(l.date_created).toISOString() : null,
+      };
+    });
+    const st = agentStates(dest.uses[0].cfg, all).find(s => digits(s.number) === d);
+    const active = dest.uses.some(u => u.agent.active);
+    const lineNames = new Set(dest.uses.map(u => queueName(u.line)));
+    const waiting = qs.filter(q => lineNames.has(q.friendly_name)).reduce((n, q) => n + (Number(q.current_size) || 0), 0);
+    res.json({
+      number: dest.number, name: dest.name,
+      lines: {
+        capacity: Math.max(...dest.uses.map(u => u.agent.capacity)), inUse: st.inUse, talking: st.onCall, ringing: st.ringing,
+        state: !active ? 'paused' : st.state === 'cooldown' ? 'free' : st.state,
+      },
+      waiting, live, liveOk: calls != null, fetchedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(502).json({ error: 'Could not load live calls. Retrying…' });
+  }
+});
+
+const portalHist = new Map();
+app.get('/portal/history', requirePortal, async (req, res) => {
+  const d = req.dest;
+  const now = Date.now();
+  let to = Date.parse(req.query.to) || now, from = Date.parse(req.query.from) || now - 86400000;
+  to = Math.min(to, now + 60000);
+  from = Math.max(from, to - 31 * 86400000);
+  const key = `${d}|${Math.floor(from / 60000)}|${Math.floor(to / 60000)}`;
+  const hit = portalHist.get(key);
+  if (hit && now - hit.at < 30000) return res.json(hit.data);
+  try {
+    const dest = await findDest(d);
+    if (!dest) return res.status(404).json({ error: 'This number is no longer set up. Contact your account manager.' });
+    const since = new Date(from).toISOString().slice(0, 10);
+    const lines = [...new Set(dest.uses.map(u => u.line))];
+    const [legs, ...parentLists] = await Promise.all([
+      listCalls(`To=${encodeURIComponent(dest.number)}&StartTime%3E=${since}`, 10),
+      ...lines.map(l => listCalls(`To=${encodeURIComponent(l)}&StartTime%3E=${since}`, 10).catch(() => [])),
+    ]);
+    const parents = new Map(parentLists.flat().map(c => [c.sid, c]));
+    const rows = [];
+    for (const l of legs) {
+      if (!l.parent_call_sid) continue; // only calls forwarded by your routing
+      const t = Date.parse(l.date_created || l.start_time);
+      if (!(t >= from && t <= to)) continue;
+      const p = parents.get(l.parent_call_sid);
+      rows.push({
+        time: new Date(t).toISOString(),
+        caller: p ? (p.from_formatted || p.from) : (l.from_formatted || l.from),
+        callerE164: p ? p.from : l.from,
+        line: p ? (p.to_formatted || p.to) : '',
+        status: l.status,
+        duration: l.status === 'completed' ? Number(l.duration) || 0 : 0,
+      });
+    }
+    rows.sort((a, b) => b.time.localeCompare(a.time));
+    const data = { from: new Date(from).toISOString(), to: new Date(to).toISOString(), rows, truncated: legs.length >= 5000 };
+    portalHist.set(key, { at: now, data });
+    if (portalHist.size > 200) portalHist.delete(portalHist.keys().next().value);
+    res.json(data);
+  } catch (e) {
+    console.error(e);
+    res.status(502).json({ error: 'Could not load call history. Please try again.' });
   }
 });
 
