@@ -78,8 +78,9 @@ function requireAuth(req, res, next) {
 const BASIC = 'Basic ' + Buffer.from(`${SID}:${AUTH}`).toString('base64');
 const BASE = `/2010-04-01/Accounts/${SID}`;
 
-async function twilio(path, { form } = {}) {
+async function twilio(path, { form, method } = {}) {
   const opts = { headers: { Authorization: BASIC } };
+  if (method) opts.method = method;
   if (form) {
     opts.method = 'POST';
     opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
@@ -92,7 +93,7 @@ async function twilio(path, { form } = {}) {
     try { msg = JSON.parse(body).message || msg; } catch {}
     throw new Error(`Twilio ${r.status}: ${msg}`);
   }
-  return r.json();
+  return r.status === 204 ? {} : r.json();
 }
 
 async function listCalls(query, maxPages = 6) {
@@ -216,11 +217,10 @@ const queueName = to => 'cc' + digits(to);
 // --- Rules: validated on save, packed compactly into the number's Voice URL ---
 const clampInt = (v, lo, hi, d) => { const n = parseInt(v, 10); return isNaN(n) ? d : Math.min(hi, Math.max(lo, n)); };
 
-function validateCfg(inp, lineNumber) {
-  if (!inp || typeof inp !== 'object') return { error: 'Missing settings.' };
-  const list = Array.isArray(inp.agents) ? inp.agents : [];
-  if (!list.length) return { error: 'Add at least one agent number.' };
-  if (list.length > 10) return { error: 'Up to 10 agents per number.' };
+function validateAgents(list, lineNumber) {
+  list = Array.isArray(list) ? list : [];
+  if (!list.length) return { error: 'Add at least one destination number.' };
+  if (list.length > 10) return { error: 'Up to 10 destinations per number.' };
   const seen = new Set(), agents = [];
   for (const a of list) {
     const number = String(a && a.number || '').replace(/[\s().-]/g, '');
@@ -235,6 +235,14 @@ function validateCfg(inp, lineNumber) {
     agents.push({ number, name: String(a.name || '').trim().slice(0, 30), active: a.active !== false,
       capacity: clampInt(a.capacity, 1, 50, 1), sendDigits });
   }
+  return { agents };
+}
+
+function validateCfg(inp, lineNumber) {
+  if (!inp || typeof inp !== 'object') return { error: 'Missing settings.' };
+  const va = validateAgents(inp.agents, lineNumber);
+  if (va.error) return va;
+  const agents = va.agents;
   const holdMusic = String(inp.holdMusic || '').trim();
   if (holdMusic && (!/^https?:\/\/\S+$/.test(holdMusic) || holdMusic.length > 200)) {
     return { error: 'Hold music must be a link to an .mp3 or .wav file (http/https).' };
@@ -251,6 +259,7 @@ function validateCfg(inp, lineNumber) {
       afterWait: inp.afterWait === 'hangup' ? 'hangup' : 'voicemail',
       message: String(inp.message || '').trim().slice(0, 200),
       holdMusic,
+      preset: /^AP[0-9a-f]{32}$/i.test(inp.preset || '') ? inp.preset : '',
       prev: '',
     },
   };
@@ -266,6 +275,7 @@ function pack(c) {
   if (c.message) p.g = c.message;
   if (c.holdMusic) p.h = c.holdMusic;
   if (c.prev) p.p = c.prev;
+  if (c.preset) p.x = c.preset;
   return Buffer.from(JSON.stringify(p)).toString('base64url');
 }
 function unpack(s) {
@@ -277,7 +287,7 @@ function unpack(s) {
         capacity: Math.max(1, Number(cap) || 1), sendDigits: String(sd || '') })),
       mode: p.m ? 'rotate' : 'priority', ringTimeout: p.r || 20, screen: !!p.s, callerId: p.k ? 'twilio' : 'caller',
       whenBusy: BUSY[p.b] || 'queue', maxWait: p.w || 300, afterWait: p.o ? 'hangup' : 'voicemail',
-      message: p.g || '', holdMusic: p.h || '', prev: p.p || '',
+      message: p.g || '', holdMusic: p.h || '', prev: p.p || '', preset: p.x || '',
     };
   } catch { return null; }
 }
@@ -598,6 +608,10 @@ app.post('/api/routing/:sid', requireAuth, async (req, res) => {
     const v = validateCfg(req.body.config, cur.phone_number);
     if (v.error) return res.status(400).json({ error: v.error });
     v.cfg.prev = prev.length <= 300 ? prev : '';
+    if (v.cfg.preset) {
+      const pr = (await listPresets()).find(x => x.id === v.cfg.preset);
+      if (!pr || !sameDestinations(pr.agents, v.cfg.agents)) v.cfg.preset = ''; // edited by hand: no longer follows the config
+    }
     const base = publicBase(req);
     if (/^http:\/\/(localhost|127\.)/.test(base)) {
       return res.status(400).json({ error: 'This server has no public address yet. Deploy it to Render first.' });
@@ -612,25 +626,7 @@ app.post('/api/routing/:sid', requireAuth, async (req, res) => {
     await twilio(path, { form });
     routedCache.at = 0;
 
-    // Lines belong to the PBX, not to the Twilio number: copy line counts to every other
-    // routed number that forwards to the same destination.
-    const caps = new Map(v.cfg.agents.map(a => [digits(a.number), a.capacity]));
-    const synced = [];
-    const all = (await twilio(`${BASE}/IncomingPhoneNumbers.json?PageSize=100`)).incoming_phone_numbers || [];
-    for (const n of all) {
-      if (n.sid === sid) continue;
-      const other = cfgFromUrl(n.voice_url);
-      if (!other) continue;
-      let changed = false;
-      for (const a of other.agents) {
-        const cap = caps.get(digits(a.number));
-        if (cap && cap !== a.capacity) { a.capacity = cap; changed = true; }
-      }
-      if (!changed) continue;
-      const otherBase = n.voice_url.slice(0, n.voice_url.indexOf('/voice/incoming?c='));
-      await twilio(`${BASE}/IncomingPhoneNumbers/${n.sid}.json`, { form: { VoiceUrl: `${otherBase}/voice/incoming?c=${pack(other)}` } });
-      synced.push(n.phone_number);
-    }
+    const synced = await syncDestinations(v.cfg.agents, sid);
     res.json({ ok: true, synced });
   } catch (e) {
     console.error(e);
@@ -828,6 +824,137 @@ app.get('/portal/history', requirePortal, async (req, res) => {
     console.error(e);
     res.status(502).json({ error: 'Could not load call history. Please try again.' });
   }
+});
+
+// =====================================================================
+// Sellers are the same everywhere: a destination's name, lines, pause and
+// extension follow its phone number across all of your Twilio numbers.
+// =====================================================================
+const sameDestinations = (a, b) => a.map(x => digits(x.number)).join() === b.map(x => digits(x.number)).join();
+
+async function saveNumberCfg(n, cfg) {
+  const base = n.voice_url.slice(0, n.voice_url.indexOf('/voice/incoming?c='));
+  await twilio(`${BASE}/IncomingPhoneNumbers/${n.sid}.json`, { form: { VoiceUrl: `${base}/voice/incoming?c=${pack(cfg)}` } });
+}
+
+async function syncDestinations(source, exceptSid) {
+  const by = new Map(source.map(a => [digits(a.number), a]));
+  const synced = [];
+  const all = (await twilio(`${BASE}/IncomingPhoneNumbers.json?PageSize=100`)).incoming_phone_numbers || [];
+  for (const n of all) {
+    if (n.sid === exceptSid) continue;
+    const cfg = cfgFromUrl(n.voice_url);
+    if (!cfg) continue;
+    let changed = false;
+    for (const a of cfg.agents) {
+      const src = by.get(digits(a.number));
+      if (!src) continue;
+      for (const k of ['name', 'active', 'capacity', 'sendDigits']) {
+        if (src[k] === undefined) continue; // only copy what the source actually sets
+        if (a[k] !== src[k]) { a[k] = src[k]; changed = true; }
+      }
+    }
+    if (!changed) continue;
+    await saveNumberCfg(n, cfg);
+    synced.push(n.phone_number);
+  }
+  routedCache.at = 0;
+  return synced;
+}
+
+// =====================================================================
+// Saved configs (destination lists you can reuse on any number).
+// Stored in your Twilio account as TwiML Apps named "Routing config: …",
+// so they survive restarts without a database.
+// =====================================================================
+const PRESET_PREFIX = 'Routing config: ';
+let presetCache = { at: 0, p: null };
+function listPresets() {
+  if (presetCache.p && Date.now() - presetCache.at < 15000) return presetCache.p;
+  presetCache.at = Date.now();
+  presetCache.p = twilio(`${BASE}/Applications.json?PageSize=100`).then(r => (r.applications || [])
+    .filter(a => String(a.friendly_name || '').startsWith(PRESET_PREFIX))
+    .map(a => {
+      const m = /\/voice\/config\?c=([A-Za-z0-9_-]+)/.exec(a.voice_url || '');
+      let agents = [];
+      try { agents = JSON.parse(Buffer.from(m[1], 'base64url').toString()).map(([number, name, cap, sd]) => ({ number, name, capacity: cap || 1, sendDigits: sd || '' })); } catch {}
+      return { id: a.sid, name: a.friendly_name.slice(PRESET_PREFIX.length), agents };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name)))
+    .catch(e => { presetCache.at = 0; throw e; });
+  return presetCache.p;
+}
+
+// If someone attaches a config's TwiML App to a number by mistake, just end the call politely.
+app.all('/voice/config', (req, res) => twiml(res, '<Say>Sorry, this line is not set up.</Say><Hangup/>'));
+
+app.get('/api/presets', requireAuth, async (req, res) => {
+  try {
+    const [presets, nums] = await Promise.all([listPresets(), routedNumbers()]);
+    res.json({ presets: presets.map(p => ({ ...p, usedBy: nums.filter(n => n.cfg.preset === p.id).map(n => n.number) })) });
+  } catch (e) { console.error(e); res.status(502).json({ error: e.message }); }
+});
+
+app.post('/api/presets', requireAuth, async (req, res) => {
+  try {
+    const name = String(req.body.name || '').trim().slice(0, 40);
+    if (!name) return res.status(400).json({ error: 'Give the config a name.' });
+    const va = validateAgents(req.body.agents, '');
+    if (va.error) return res.status(400).json({ error: va.error });
+    const id = /^AP[0-9a-f]{32}$/i.test(req.body.id || '') ? req.body.id : '';
+    const existing = await listPresets();
+    if (existing.some(p => p.name.toLowerCase() === name.toLowerCase() && p.id !== id)) return res.status(400).json({ error: `A config called "${name}" already exists.` });
+    const packed = Buffer.from(JSON.stringify(va.agents.map(a => [a.number, a.name, a.capacity, a.sendDigits]))).toString('base64url');
+    const form = { FriendlyName: PRESET_PREFIX + name, VoiceUrl: `${publicBase(req)}/voice/config?c=${packed}`, VoiceMethod: 'POST' };
+    const app_ = await twilio(id ? `${BASE}/Applications/${id}.json` : `${BASE}/Applications.json`, { form });
+    presetCache.at = 0;
+    const presetId = app_.sid || id;
+
+    // Numbers that follow this config get its destination list. Lines and pause keep their
+    // current value where the seller is already in use; new sellers start with the config's lines.
+    const updated = [];
+    if (id && req.body.applyToNumbers !== false) {
+      const nums = await routedNumbers();
+      const current = new Map();
+      for (const n of nums) for (const a of n.cfg.agents) current.set(digits(a.number), a);
+      const all = (await twilio(`${BASE}/IncomingPhoneNumbers.json?PageSize=100`)).incoming_phone_numbers || [];
+      for (const n of all) {
+        const cfg = cfgFromUrl(n.voice_url);
+        if (!cfg || cfg.preset !== id) continue;
+        if (va.agents.some(a => digits(a.number) === digits(n.phone_number))) continue; // never forward a line to itself
+        cfg.agents = va.agents.map(a => {
+          const cur = current.get(digits(a.number));
+          return { number: a.number, name: a.name, sendDigits: a.sendDigits,
+            active: cur ? cur.active : true, capacity: cur ? cur.capacity : a.capacity };
+        });
+        await saveNumberCfg(n, cfg);
+        updated.push(n.phone_number);
+      }
+      routedCache.at = 0;
+    }
+    // Names and extensions follow the config on every number; lines and pause are left as they are.
+    const synced = await syncDestinations(va.agents.map(a => ({ number: a.number, name: a.name, sendDigits: a.sendDigits })), null)
+      .catch(e => { console.error('Config sync:', e.message); return []; });
+    res.json({ ok: true, id: presetId, updated, synced });
+  } catch (e) { console.error(e); res.status(502).json({ error: e.message }); }
+});
+
+app.post('/api/presets/:id/delete', requireAuth, async (req, res) => {
+  const id = req.params.id;
+  if (!/^AP[0-9a-f]{32}$/i.test(id)) return res.status(400).json({ error: 'Unknown config.' });
+  try {
+    const p = (await listPresets()).find(x => x.id === id);
+    if (!p) return res.status(404).json({ error: 'Config not found.' });
+    await twilio(`${BASE}/Applications/${id}.json`, { method: 'DELETE' });
+    presetCache.at = 0;
+    const all = (await twilio(`${BASE}/IncomingPhoneNumbers.json?PageSize=100`)).incoming_phone_numbers || [];
+    for (const n of all) {
+      const cfg = cfgFromUrl(n.voice_url);
+      if (cfg && cfg.preset === id) { cfg.preset = ''; await saveNumberCfg(n, cfg); }
+    }
+    routedCache.at = 0;
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(502).json({ error: e.message }); }
 });
 
 app.get('/', (req, res) => res.json({ ok: true, service: 'twilio-dashboard-backend' }));
