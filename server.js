@@ -124,6 +124,8 @@ const slim = c => ({
   parentSid: c.parent_call_sid || null,
   from: c.from_formatted || c.from,
   to: c.to_formatted || c.to,
+  fromE164: c.from || '',
+  toE164: c.to || '',
   status: c.status,
   direction: dirOf(c),
   startTime: c.start_time ? new Date(c.start_time).toISOString() : null,
